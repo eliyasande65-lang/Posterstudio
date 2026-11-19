@@ -4,12 +4,13 @@ Tabs (bottom bar) keep the screen uncluttered, one group of controls at a time:
   Add     text, image and 10 shapes
   Edit    duplicate, delete, lock, centre, reset, rotation, opacity
   Style   controls for the selected item (text / shape / image)
-  Layers  pick any item from a list, move it up or down
+  Layers  raised 3D layer cards, selection, locking and layer ordering
   Page    poster size, background colour and gradient
 """
 import math
 import os
 import time
+import threading
 
 from kivy.app import App
 from kivy import kivy_data_dir
@@ -27,7 +28,7 @@ from kivy.uix.colorpicker import ColorPicker
 from kivy.uix.filechooser import FileChooserIconView
 from kivy.uix.gridlayout import GridLayout
 from kivy.uix.label import Label
-from kivy.uix.popup import Popup
+from kivy.uix.popup import Popup as _KivyPopup
 from kivy.uix.scatter import Scatter
 from kivy.uix.scrollview import ScrollView
 from kivy.uix.slider import Slider
@@ -36,23 +37,28 @@ from kivy.uix.textinput import TextInput
 from kivy.utils import get_color_from_hex, platform
 
 from PIL import Image as PILImage
-from PIL import ImageEnhance, ImageOps
+from PIL import ImageEnhance, ImageOps, ImageChops
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 FONT_DIR = os.path.join(APP_DIR, "fonts")
 
 # ----------------------------------------------------------------- theme --
-UI_BG = get_color_from_hex("#14112b")
-UI_PANEL = get_color_from_hex("#1d1941")
-UI_BTN = get_color_from_hex("#2c2763")
-UI_ACCENT = get_color_from_hex("#1fb58f")
-UI_DANGER = get_color_from_hex("#8b1e3f")
+# Black chrome: near-black surfaces, graphite metal buttons, silver accents.
+UI_BG = get_color_from_hex("#050506")
+UI_PANEL = get_color_from_hex("#0b0b0d")
+UI_BTN = get_color_from_hex("#25262b")          # graphite metal
+UI_ACCENT = get_color_from_hex("#cfd3da")       # polished silver
+UI_DANGER = get_color_from_hex("#8a1426")       # dark red metal
+UI_STEEL = get_color_from_hex("#3b3e46")        # gunmetal
 UI_TEXT = (1, 1, 1, 1)
-SELECT_COLOR = (0.12, 0.71, 0.56, 1)
+UI_TEXT_DARK = (0.03, 0.03, 0.04, 1)
+UI_SILVER = (0.84, 0.87, 0.92, 1)
+UI_EDGE = (0.50, 0.52, 0.58, 1)
+SELECT_COLOR = (0.84, 0.88, 0.95, 1)
 LOCKED_COLOR = (0.98, 0.62, 0.2, 1)
 
 PALETTE = [
-    "#000000", "#ffffff", "#1a1535", "#1fb58f", "#16a34a", "#0ea5e9",
+    "#000000", "#ffffff", "#1a1a1d", "#1fb58f", "#16a34a", "#0ea5e9",
     "#2563eb", "#7c3aed", "#db2777", "#dc2626", "#f97316", "#facc15",
 ]
 SHAPE_FILLS = ["#1fb58f", "#0ea5e9", "#f97316", "#7c3aed", "#dc2626",
@@ -171,17 +177,145 @@ def discover_fonts():
 
 
 # ------------------------------------------------------------ ui helpers --
+def _mix(a, b, t):
+    """Linear blend of two RGB(A) tuples."""
+    return tuple(a[i] + (b[i] - a[i]) * t for i in range(3))
+
+
+_WHITE = (1.0, 1.0, 1.0)
+_BLACK = (0.0, 0.0, 0.0)
+_TEX_CACHE = {}
+
+
+def metal_texture(tone, pressed=False):
+    """1 x N vertical gradient that reads as polished metal.
+
+    Bright top, a darker "horizon" line near the middle, a softer reflected
+    band underneath and a dark base - the classic chrome look.
+    """
+    key = (tuple(round(c, 3) for c in tone[:3]), pressed)
+    tex = _TEX_CACHE.get(key)
+    if tex is not None:
+        return tex
+    base = tone[:3]
+    top = _mix(base, _WHITE, 0.30)
+    mid = _mix(base, _BLACK, 0.30)
+    low = _mix(base, _WHITE, 0.04)
+    bot = _mix(base, _BLACK, 0.38)
+    if pressed:                       # pushed in: darker and inverted
+        top, mid, low, bot = (_mix(c, _BLACK, 0.35)
+                              for c in (bot, low, mid, top))
+    n = 32
+    buf = bytearray()
+    for i in range(n):                # row 0 is the bottom of the button
+        y = 1.0 - i / (n - 1)         # 0 at top .. 1 at bottom
+        if y < 0.5:
+            c = _mix(top, mid, y / 0.5)
+        else:
+            c = _mix(low, bot, (y - 0.5) / 0.5)
+        buf.extend((int(c[0] * 255), int(c[1] * 255), int(c[2] * 255), 255))
+    tex = Texture.create(size=(1, n), colorfmt="rgba")
+    tex.blit_buffer(bytes(buf), colorfmt="rgba", bufferfmt="ubyte")
+    tex.mag_filter = "linear"
+    tex.min_filter = "linear"
+    _TEX_CACHE[key] = tex
+    return tex
+
+
+class MetalButton(Button):
+    """Rounded metallic button: gradient body, top glint, rim and shadow."""
+    tone = ListProperty([0.15, 0.15, 0.17, 1])
+
+    def __init__(self, tone=None, **kw):
+        kw.pop("background_color", None)
+        super().__init__(background_normal="", background_down="",
+                         background_color=(0, 0, 0, 0), **kw)
+        if tone is not None:
+            self.tone = list(tone)
+        r = dp(9)
+        with self.canvas.before:
+            self._sh_c = Color(0, 0, 0, 0.9)
+            self._sh = RoundedRectangle(radius=[r])
+            Color(1, 1, 1, 1)
+            self._body = RoundedRectangle(radius=[r])
+            self._glint_c = Color(1, 1, 1, 0.55)
+            self._glint = Line(points=[0, 0, 0, 0], width=dp(0.8))
+            self._rim_c = Color(*UI_EDGE[:3], 0.55)
+            self._rim = Line(rounded_rectangle=(0, 0, 1, 1, r), width=dp(0.9))
+        self.bind(pos=self._layout, size=self._layout, tone=self._restyle,
+                  state=self._restyle)
+        self._restyle()
+
+    def _layout(self, *_):
+        x, y = self.pos
+        w, h = self.size
+        r = dp(9)
+        self._sh.pos = (x, y - dp(2))
+        self._sh.size = (w, h)
+        self._body.pos = (x, y)
+        self._body.size = (w, h)
+        self._rim.rounded_rectangle = (x, y, w, h, r)
+        gy = y + h - dp(2.5)
+        self._glint.points = [x + r, gy, x + w - r, gy]
+
+    def _restyle(self, *_):
+        pressed = self.state == "down"
+        self._body.texture = metal_texture(self.tone, pressed)
+        self._glint_c.a = 0.15 if pressed else 0.55
+        r, g, b = self.tone[:3]
+        lum = 0.299 * r + 0.587 * g + 0.114 * b
+        self.color = UI_TEXT_DARK if lum > 0.5 else UI_TEXT
+
+
 def flat_button(text, on_press=None, bg=UI_BTN, **kw):
     kw.setdefault("font_size", "13sp")
-    btn = Button(text=text, background_normal="", background_down="",
-                 background_color=bg, color=UI_TEXT, **kw)
+    if len(bg) > 3 and bg[3] == 0:            # fully transparent: plain button
+        btn = Button(text=text, background_normal="", background_down="",
+                     background_color=bg, color=UI_TEXT, **kw)
+    else:
+        btn = MetalButton(tone=bg, text=text, **kw)
     if on_press:
         btn.bind(on_release=lambda *_: on_press())
     return btn
 
 
+class MetalBar(BoxLayout):
+    """Dark brushed-metal strip with a hairline highlight on one edge."""
+
+    def __init__(self, edge="top", **kw):
+        super().__init__(**kw)
+        self._edge_side = edge
+        with self.canvas.before:
+            Color(1, 1, 1, 1)
+            self._bg = Rectangle(texture=metal_texture((0.075, 0.075, 0.085)))
+            self._hl_c = Color(0.75, 0.78, 0.85, 0.35)
+            self._hl = Line(points=[0, 0, 0, 0], width=dp(0.8))
+        self.bind(pos=self._layout, size=self._layout)
+
+    def _layout(self, *_):
+        x, y = self.pos
+        w, h = self.size
+        self._bg.pos = self.pos
+        self._bg.size = self.size
+        ly = y + h if self._edge_side == "top" else y
+        self._hl.points = [x, ly, x + w, ly]
+
+
+class Popup(_KivyPopup):
+    """Kivy popup restyled as a black metal panel with a silver title rule."""
+
+    def __init__(self, **kw):
+        kw.setdefault("background", "")
+        kw.setdefault("background_color", (0.035, 0.035, 0.042, 0.98))
+        kw.setdefault("separator_color", UI_SILVER)
+        kw.setdefault("title_color", UI_SILVER)
+        kw.setdefault("overlay_color", (0, 0, 0, 0.75))
+        super().__init__(**kw)
+
+
 def caption(text, width=dp(84)):
-    return Label(text=text, size_hint_x=None, width=width, color=UI_TEXT,
+    return Label(text=text, size_hint_x=None, width=width,
+                 color=(0.86, 0.88, 0.92, 1),
                  font_size="13sp", halign="left", valign="middle",
                  text_size=(width, None))
 
@@ -189,7 +323,8 @@ def caption(text, width=dp(84)):
 def labelled_slider(name, lo, hi, value, step=0, on_value=None):
     row = BoxLayout(size_hint_y=None, height=dp(40), spacing=dp(6))
     slider = Slider(min=lo, max=hi, value=value, step=step,
-                    cursor_size=(dp(24), dp(24)))
+                    cursor_size=(dp(24), dp(24)), value_track=True,
+                    value_track_color=UI_SILVER, value_track_width=dp(3))
     if on_value:
         slider.bind(value=lambda _w, v: on_value(v))
     row.add_widget(caption(name))
@@ -210,7 +345,9 @@ class ScrollPanel(ScrollView):
     """A vertical stack of rows that scrolls when it does not fit."""
 
     def __init__(self, **kw):
-        super().__init__(do_scroll_x=False, bar_width=dp(3), **kw)
+        super().__init__(do_scroll_x=False, bar_width=dp(3),
+                         bar_color=(0.82, 0.85, 0.9, 0.9),
+                         bar_inactive_color=(0.82, 0.85, 0.9, 0.25), **kw)
         self.col = GridLayout(cols=1, size_hint_y=None, spacing=dp(6),
                               padding=dp(8))
         self.col.bind(minimum_height=self.col.setter("height"))
@@ -245,9 +382,14 @@ class Item(Scatter):
         g = self._sel
         g.clear()
         if self.selected:
+            k = 1.0 / max(self.scale, 0.05)
+            # dark under-stroke + bright stroke: visible on any background
+            g.add(Color(0, 0, 0, 0.85))
+            g.add(Line(rectangle=(0, 0, self.width, self.height),
+                       width=dp(2.8) * k))
             g.add(Color(*(LOCKED_COLOR if self.locked else SELECT_COLOR)))
             g.add(Line(rectangle=(0, 0, self.width, self.height),
-                       width=dp(1.6) / max(self.scale, 0.05)))
+                       width=dp(1.3) * k))
         if self._sel_on_canvas:            # keep the outline on top
             self.canvas.remove(g)
         self.canvas.add(g)
@@ -332,7 +474,7 @@ class TextItem(Item):
 
 class ShapeItem(Item):
     fill = ListProperty([0.12, 0.71, 0.56, 1])
-    stroke = ListProperty([0.1, 0.08, 0.2, 1])
+    stroke = ListProperty([0.05, 0.05, 0.06, 1])
     stroke_w = NumericProperty(0)
     radius = NumericProperty(24)
 
@@ -450,6 +592,45 @@ class ImageItem(Item):
         out = adjust(source, self.brightness, self.contrast,
                      self.sharpness, self.saturation)
         self._rect.texture = pil_to_texture(out)
+
+    def remove_color_background(self, color, tolerance=38, feather=18):
+        """Remove pixels close to an RGB colour, preserving existing transparency.
+
+        This is a lightweight offline colour-key remover, not semantic AI
+        segmentation. It works best with plain/solid backgrounds.
+        """
+        base = self.full.convert("RGBA")
+        rgb = base.convert("RGB")
+        target = PILImage.new("RGB", rgb.size, tuple(int(v) for v in color[:3]))
+        diff = ImageChops.difference(rgb, target)
+        distance = ImageChops.lighter(
+            ImageChops.lighter(diff.getchannel("R"), diff.getchannel("G")),
+            diff.getchannel("B")
+        )
+        tolerance = max(0, min(255, int(tolerance)))
+        feather = max(0, min(255, int(feather)))
+        if feather == 0:
+            mask = distance.point(lambda value: 0 if value <= tolerance else 255)
+        else:
+            edge = tolerance + feather
+            mask = distance.point(
+                lambda value: 0 if value <= tolerance else
+                255 if value >= edge else
+                int((value - tolerance) * 255 / max(1, feather))
+            )
+        alpha = ImageChops.multiply(base.getchannel("A"), mask)
+        base.putalpha(alpha)
+        self.full = base
+        self.small = base.copy()
+        self.small.thumbnail((MAX_PREVIEW, MAX_PREVIEW), LANCZOS)
+        self._apply(self.full)
+
+    def apply_ai_background_result(self, result):
+        """Install a completed optional rembg result on the UI thread."""
+        self.full = result.convert("RGBA")
+        self.small = self.full.copy()
+        self.small.thumbnail((MAX_PREVIEW, MAX_PREVIEW), LANCZOS)
+        self._apply(self.full)
 
     def title(self):
         return "Image"
@@ -613,7 +794,22 @@ class TextStyle(ScrollPanel):
         self._lock = False
         self.input = TextInput(multiline=True, size_hint_y=None,
                                height=dp(70), font_size="15sp",
-                               hint_text="Type your text")
+                               hint_text="Type your text",
+                               background_normal="", background_active="",
+                               background_color=(0.03, 0.03, 0.035, 1),
+                               foreground_color=(0.95, 0.96, 0.98, 1),
+                               hint_text_color=(0.5, 0.52, 0.57, 1),
+                               cursor_color=UI_SILVER,
+                               selection_color=(0.84, 0.87, 0.92, 0.35),
+                               padding=(dp(10), dp(8)))
+        with self.input.canvas.after:
+            Color(*UI_EDGE[:3], 0.6)
+            self._in_rim = Line(rectangle=(0, 0, 1, 1), width=dp(0.9))
+        self.input.bind(
+            pos=lambda w, _v: setattr(self._in_rim, "rectangle",
+                                      (w.x, w.y, w.width, w.height)),
+            size=lambda w, _v: setattr(self._in_rim, "rectangle",
+                                       (w.x, w.y, w.width, w.height)))
         self.input.bind(text=self._on_text)
         self.row(self.input)
         r, self.size_slider = labelled_slider("Size", 16, 220, 56, 1,
@@ -780,6 +976,12 @@ class ImageStyle(ScrollPanel):
             flat_button("Flip", self._flip),
             flat_button("Reset adjustments", self._reset),
         ], 2))
+        self.row(button_grid([
+            flat_button("Remove BG (colour)", self._remove_colour_bg,
+                        bg=UI_ACCENT),
+            flat_button("AI Remove BG", self._remove_ai_bg,
+                        bg=UI_STEEL),
+        ], 2))
 
     def bind_item(self, item):
         self._lock = True
@@ -787,6 +989,67 @@ class ImageStyle(ScrollPanel):
         for key, s in self.sliders.items():
             s.value = getattr(item, key)
         self._lock = False
+
+    def _remove_colour_bg(self):
+        if not self.item:
+            return
+        item = self.item
+        sample = item.full.convert("RGB").getpixel((0, 0))
+        picker = ColorPicker(size_hint_y=0.62)
+        picker.color = [sample[0] / 255, sample[1] / 255,
+                        sample[2] / 255, 1]
+        controls = BoxLayout(orientation="vertical", spacing=dp(5),
+                            padding=dp(8))
+        row1, tolerance = labelled_slider("Tolerance", 0, 180, 38, 1)
+        row2, feather = labelled_slider("Soft edge", 0, 100, 18, 1)
+        controls.add_widget(picker)
+        controls.add_widget(row1)
+        controls.add_widget(row2)
+        controls.add_widget(Label(
+            text="Removes matching colours throughout the image. Best for "
+                 "plain backgrounds; internal areas of the same colour "
+                 "may also become transparent.",
+            size_hint_y=None, height=dp(48), font_size="11sp",
+            color=(1, 1, 1, 0.8), halign="center"
+        ))
+        pop = Popup(title="Colour background remover",
+                    content=controls, size_hint=(0.94, 0.88))
+        controls.add_widget(flat_button(
+            "Apply removal",
+            lambda: (item.remove_color_background(
+                picker.color, tolerance.value, feather.value), pop.dismiss()),
+            bg=UI_ACCENT, size_hint_y=None, height=dp(46)
+        ))
+        pop.open()
+
+    def _remove_ai_bg(self):
+        if not self.item:
+            return
+        item = self.item
+        self.app = App.get_running_app()
+        self.app.notify("AI background removal is starting. It requires the "
+                        "optional rembg package and its model.")
+        def worker():
+            try:
+                from rembg import remove
+                result = remove(item.full.copy()).convert("RGBA")
+                Clock.schedule_once(
+                    lambda _dt: self._finish_ai(item, result, None), 0)
+            except Exception as exc:
+                Clock.schedule_once(
+                    lambda _dt, error=str(exc): self._finish_ai(
+                        item, None, error), 0)
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _finish_ai(self, item, result, error):
+        if error:
+            App.get_running_app().notify(
+                "AI removal unavailable. Install/package rembg and its "
+                "runtime/model first.\n%s" % error)
+            return
+        if item in App.get_running_app().poster.children:
+            item.apply_ai_background_result(result)
+            App.get_running_app().notify("AI background removed.")
 
     def _set(self, **kw):
         if not self._lock and self.item:
@@ -814,6 +1077,60 @@ class HintPanel(BoxLayout):
                               valign="middle"))
 
 
+class LayerCard(BoxLayout):
+    """Raised dark layer tile with a clear selected state and lock action."""
+    selected = BooleanProperty(False)
+
+    def __init__(self, item, on_select, on_lock, **kw):
+        super().__init__(orientation="horizontal", size_hint_y=None,
+                         height=dp(58), spacing=dp(7),
+                         padding=(dp(8), dp(6)), **kw)
+        self.item = item
+        self.on_select = on_select
+        self.on_lock = on_lock
+        with self.canvas.before:
+            self._shadow_c = Color(0, 0, 0, 0.95)
+            self._shadow = RoundedRectangle(radius=[dp(10)])
+            self._panel_c = Color(0.085, 0.085, 0.095, 1)
+            self._panel = RoundedRectangle(radius=[dp(10)])
+            self._edge_c = Color(0.34, 0.35, 0.40, 1)
+            self._edge = Line(rounded_rectangle=(0, 0, 1, 1, dp(10)),
+                              width=1)
+            self._accent_c = Color(*SELECT_COLOR)
+            self._accent = RoundedRectangle(radius=[dp(3)])
+        self.bind(pos=self._draw_card, size=self._draw_card,
+                  selected=self._draw_card)
+        self._draw_card()
+        title = item.title() + ("  •  LOCKED" if item.locked else "")
+        self.title_btn = flat_button(
+            title, lambda: self.on_select(item), bg=(0, 0, 0, 0),
+            halign="left", valign="middle"
+        )
+        self.title_btn.text_size = (None, None)
+        self.add_widget(self.title_btn)
+        self.lock_btn = flat_button(
+            "UNLOCK" if item.locked else "LOCK",
+            lambda: self.on_lock(item), bg=UI_BTN,
+            size_hint_x=None, width=dp(66), font_size="10sp"
+        )
+        self.add_widget(self.lock_btn)
+
+    def _draw_card(self, *_):
+        x, y = self.pos
+        w, h = self.size
+        self._shadow.pos = (x + dp(1), y - dp(3))
+        self._shadow.size = (w - dp(2), h)
+        self._panel.pos = (x, y + dp(2))
+        self._panel.size = (w, h - dp(3))
+        self._edge.rounded_rectangle = (x, y + dp(2), w, h - dp(3), dp(10))
+        self._accent.pos = (x + dp(3), y + dp(10))
+        self._accent.size = (dp(4), h - dp(19))
+        self._accent_c.rgba = SELECT_COLOR if self.selected else (
+            0.22, 0.23, 0.26, 1)
+        self._panel_c.rgba = ((0.17, 0.175, 0.195, 1) if self.selected
+                              else (0.085, 0.085, 0.095, 1))
+
+
 class LayersTab(ScrollPanel):
     def __init__(self, app, **kw):
         super().__init__(**kw)
@@ -834,11 +1151,17 @@ class LayersTab(ScrollPanel):
                            height=dp(40), color=(1, 1, 1, 0.7),
                            font_size="13sp"))
         for item in kids:
-            name = item.title() + ("  [locked]" if item.locked else "")
-            b = flat_button(name, lambda it=item: app.select(it),
-                            bg=UI_ACCENT if item is app.sel else UI_BTN,
-                            size_hint_y=None, height=dp(40))
-            self.row(b)
+            card = LayerCard(
+                item,
+                on_select=lambda it: app.select(it),
+                on_lock=lambda it: self._toggle_lock(it),
+            )
+            card.selected = item is app.sel
+            self.row(card)
+
+    def _toggle_lock(self, item):
+        item.set_locked(not item.locked)
+        self.refresh()
 
 
 class PageTab(ScrollPanel):
@@ -887,11 +1210,11 @@ class PosterStudioApp(App):
 
         root = BoxLayout(orientation="vertical")
 
-        top = BoxLayout(size_hint_y=None, height=dp(50), padding=dp(8),
-                        spacing=dp(8))
-        top.add_widget(Label(text="Poster Studio", bold=True,
-                             font_size="18sp", halign="left",
-                             valign="middle"))
+        top = MetalBar(edge="bottom", size_hint_y=None, height=dp(52),
+                       padding=dp(8), spacing=dp(8))
+        top.add_widget(Label(text="POSTER STUDIO", bold=True,
+                             font_size="17sp", color=UI_SILVER,
+                             halign="left", valign="middle"))
         top.add_widget(flat_button("Export", self.export, bg=UI_ACCENT,
                                    size_hint_x=None, width=dp(100)))
         root.add_widget(top)
@@ -917,14 +1240,21 @@ class PosterStudioApp(App):
         with self.panel_box.canvas.before:
             Color(*UI_PANEL)
             self._panel_bg = Rectangle()
-        self.panel_box.bind(
-            pos=lambda *_: setattr(self._panel_bg, "pos", self.panel_box.pos),
-            size=lambda *_: setattr(self._panel_bg, "size",
-                                    self.panel_box.size))
+            Color(0.75, 0.78, 0.85, 0.35)
+            self._panel_hl = Line(points=[0, 0, 0, 0], width=dp(0.8))
+
+        def _panel_layout(*_):
+            b = self.panel_box
+            self._panel_bg.pos = b.pos
+            self._panel_bg.size = b.size
+            ly = b.y + b.height
+            self._panel_hl.points = [b.x, ly, b.right, ly]
+
+        self.panel_box.bind(pos=_panel_layout, size=_panel_layout)
         root.add_widget(self.panel_box)
 
-        bar = BoxLayout(size_hint_y=None, height=dp(48), spacing=dp(3),
-                        padding=dp(3))
+        bar = MetalBar(edge="top", size_hint_y=None, height=dp(54),
+                       spacing=dp(4), padding=dp(4))
         self.tab_buttons = {}
         for key, label in TAB_NAMES:
             b = flat_button(label, lambda k=key: self.show_tab(k),
@@ -966,8 +1296,7 @@ class PosterStudioApp(App):
 
     def _paint_tabs(self):
         for key, b in self.tab_buttons.items():
-            b.background_color = UI_ACCENT if key == self.current_tab \
-                else UI_BTN
+            b.tone = list(UI_ACCENT if key == self.current_tab else UI_BTN)
 
     def _panel_widget(self):
         tab = self.current_tab
