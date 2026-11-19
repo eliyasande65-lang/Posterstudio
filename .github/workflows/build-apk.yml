@@ -23,7 +23,7 @@ jobs:
       - name: Install Buildozer
         run: |
           pip install --upgrade pip
-          pip install buildozer==1.5.0 cython==0.29.37 virtualenv
+          pip install buildozer cython==0.29.37 virtualenv
 
       - name: Cache Buildozer downloads
         uses: actions/cache@v4
@@ -31,7 +31,7 @@ jobs:
           path: |
             ~/.buildozer
             .buildozer
-          key: buildozer-v2-${{ hashFiles('buildozer.spec') }}
+          key: buildozer-v3-${{ hashFiles('buildozer.spec') }}
 
       - name: Build APK
         shell: bash
