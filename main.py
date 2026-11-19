@@ -714,6 +714,53 @@ class Poster(StencilView):
 
 
 # ----------------------------------------------------------------- tabs --
+class ShapeIconButton(MetalButton):
+    """Metal button that shows the shape itself instead of its name."""
+
+    def __init__(self, kind, on_press=None, **kw):
+        super().__init__(tone=UI_BTN, **kw)
+        self.kind = kind
+        self._icon = InstructionGroup()
+        self.canvas.after.add(self._icon)
+        self.bind(pos=self._draw_icon, size=self._draw_icon)
+        if on_press:
+            self.bind(on_release=lambda *_: on_press())
+        self._draw_icon()
+
+    def _draw_icon(self, *_):
+        g = self._icon
+        g.clear()
+        s = min(self.width, self.height) * 0.52
+        if s <= 0:
+            return
+        k = self.kind
+        cx, cy = self.center
+        g.add(Color(0.90, 0.92, 0.96, 1))
+        if k == "rect":
+            w, h = s * 1.2, s * 0.8
+            g.add(Rectangle(pos=(cx - w / 2, cy - h / 2), size=(w, h)))
+        elif k == "round":
+            w, h = s * 1.2, s * 0.8
+            g.add(RoundedRectangle(pos=(cx - w / 2, cy - h / 2),
+                                   size=(w, h), radius=[s * 0.25]))
+        elif k == "circle":
+            g.add(Ellipse(pos=(cx - s / 2, cy - s / 2), size=(s, s)))
+        elif k == "line":
+            w, h = s * 1.4, max(dp(3), s * 0.12)
+            g.add(Rectangle(pos=(cx - w / 2, cy - h / 2), size=(w, h)))
+        else:
+            poly = polygon(k)
+            if not poly:
+                return
+            pts, (px, py) = poly
+            x0, y0 = cx - s / 2, cy - s / 2
+            verts = [x0 + px * s, y0 + py * s, 0, 0]
+            for x, y in pts + [pts[0]]:
+                verts += [x0 + x * s, y0 + y * s, 0, 0]
+            g.add(Mesh(vertices=verts, indices=list(range(len(verts) // 4)),
+                       mode="triangle_fan"))
+
+
 class AddTab(ScrollPanel):
     def __init__(self, app, **kw):
         super().__init__(**kw)
@@ -721,8 +768,8 @@ class AddTab(ScrollPanel):
                    flat_button("Image", app.add_image, bg=UI_ACCENT)]
         grid = button_grid(buttons, 2)
         self.row(grid)
-        shapes = [flat_button(name, lambda k=kind: app.add_shape(k))
-                  for name, kind in SHAPES]
+        shapes = [ShapeIconButton(kind, lambda k=kind: app.add_shape(k))
+                  for _name, kind in SHAPES]
         self.row(button_grid(shapes, 4))
 
 
